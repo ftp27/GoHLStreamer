@@ -3,7 +3,6 @@ package appwrite
 import (
 	"fmt"
 	"io"
-	"log"
 	"os"
 	
 	"net/http"
@@ -52,7 +51,6 @@ func (a *Appwrite) GetFile(fileId, filePath string) error {
 		return err
 	}
 	
-	log.Println(response)
 	defer response.Body.Close()
 
 	// Check if the request was successful (status code 200)

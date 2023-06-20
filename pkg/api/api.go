@@ -43,9 +43,6 @@ var (
 func prepareConfig() {
 	// Load settings from .env file
 	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file:", err)
-	}
 
 	// Read environment variables
 	endpoint = os.Getenv("ENDPOINT")
