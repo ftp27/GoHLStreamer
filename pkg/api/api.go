@@ -13,6 +13,7 @@ import (
 
 	"github.com/ftp27/GoHLStreamer/pkg/spaces"
 	"github.com/ftp27/GoHLStreamer/pkg/cache"
+	"github.com/ftp27/GoHLStreamer/pkg/appwrite"
 	"github.com/joho/godotenv"
 )
 
@@ -28,7 +29,14 @@ var (
 	ffmpegPath      string
 	cacheSize       int
 
+	useAppwrite	    bool
+	appwriteHost    string
+	appwriteProject string
+	appwriteSecret  string
+	appwriteBucket  string
+
 	storage 		*spaces.Spaces
+	appwriteClient  *appwrite.Appwrite
 	cacheStorage    *cache.LRUCache
 )
 
@@ -56,6 +64,17 @@ func prepareConfig() {
 	if err != nil {
 		log.Fatal("Invalid CACHE_SIZE value:", err)
 	}
+
+	appwriteHost = os.Getenv("APPWRITE_HOST")
+	if appwriteHost == "" {
+		log.Println("Appwrite integration is disabled")
+		useAppwrite = false
+	} else {
+		useAppwrite = true
+		appwriteProject = os.Getenv("APPWRITE_PROJECT")
+		appwriteSecret = os.Getenv("APPWRITE_SECRET")
+		appwriteBucket = os.Getenv("APPWRITE_BUCKET")
+	}
 }
 
 func prepareStorage() {
@@ -74,6 +93,17 @@ func prepareStorage() {
 	}
 }
 
+func prepareAppwrite() {
+	if !useAppwrite {
+		return
+	}
+	var err error
+	appwriteClient, err = appwrite.New(appwriteProject, appwriteBucket, appwriteSecret, appwriteHost)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 func prepareCache() {
 	var err error
 	cacheStorage, err = cache.New(cacheSize, tempDir)
@@ -84,7 +114,6 @@ func prepareCache() {
 
 func getObjectAndFileName(objectPath string) (string, string, error) {
 	parts := strings.SplitN(objectPath, "/", 2)
-	log.Println(parts)
 	if len(parts) != 2 {
 		return "", "", fmt.Errorf("Invalid object path: %s", objectPath)
 	}
@@ -109,6 +138,7 @@ func Run() {
 	prepareConfig()
 	prepareStorage()
 	prepareCache()
+	prepareAppwrite()
 
 	http.HandleFunc("/hls/", func(w http.ResponseWriter, r *http.Request) {
 		urlPath := r.URL.Path[len("/hls/"):]
@@ -212,9 +242,12 @@ func convertToHLS(objectName string) error {
 	mp4FilePath := filepath.Join(tempDir, objectName+".mp4")
 	mp4DOPath := fmt.Sprintf("%s/%s.mp4", inputDir, objectName)
 	
-	err = storage.FGetObject(mp4DOPath, mp4FilePath)
+	if useAppwrite {
+		err = appwriteClient.GetFile(objectName, mp4FilePath)
+	} else {
+		err = storage.FGetObject(mp4DOPath, mp4FilePath)
+	}
 	if err != nil {
-		log.Println("Here!")
 		return err
 	}
 	defer os.Remove(mp4FilePath)
