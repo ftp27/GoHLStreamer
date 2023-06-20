@@ -47,6 +47,7 @@ TEMP_DIR=<Temporary directory path for HLS conversion>
 INPUT_DIR=<Location of mp4 files in DigitalOcean Spaces>
 OUTPUT_DIR=<Location of m3u8 files in DigitalOcean Spaces>
 FFMPEG_PATH=<Path to the FFmpeg binary>
+CACHE_SIZE=<The number of files can be kept keep local>
 ```
 
 5. Run the server:

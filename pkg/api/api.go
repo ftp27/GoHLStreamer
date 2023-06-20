@@ -1,7 +1,6 @@
-package main
+package api
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,10 +9,11 @@ import (
 	"path/filepath"
 	"time"
 	"strings"
+	"strconv"
 
+	"github.com/ftp27/GoHLStreamer/pkg/spaces"
+	"github.com/ftp27/GoHLStreamer/pkg/cache"
 	"github.com/joho/godotenv"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 var (
@@ -26,9 +26,13 @@ var (
 	inputDir        string
 	outputDir       string
 	ffmpegPath      string
+	cacheSize       int
+
+	storage 		*spaces.Spaces
+	cacheStorage    *cache.LRUCache
 )
 
-func main() {
+func prepareConfig() {
 	// Load settings from .env file
 	err := godotenv.Load()
 	if err != nil {
@@ -40,96 +44,128 @@ func main() {
 	accessKeyID = os.Getenv("ACCESS_KEY_ID")
 	secretAccessKey = os.Getenv("SECRET_ACCESS_KEY")
 	bucketName = os.Getenv("BUCKET_NAME")
+
 	baseURL = os.Getenv("BASE_URL")
 	tempDir = os.Getenv("TEMP_DIR")
 	inputDir = os.Getenv("INPUT_DIR")
 	outputDir = os.Getenv("OUTPUT_DIR")
 	ffmpegPath = os.Getenv("FFMPEG_PATH")
 
-	// Initialize the DigitalOcean Spaces client.
-	minioClient, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
-		Secure: true,
-	})
+	cacheSizeStr := os.Getenv("CACHE_SIZE")
+	cacheSize, err = strconv.Atoi(cacheSizeStr)
+	if err != nil {
+		log.Fatal("Invalid CACHE_SIZE value:", err)
+	}
+}
+
+func prepareStorage() {
+	var err error
+	storage, err = spaces.New(endpoint, accessKeyID, secretAccessKey, bucketName, baseURL, inputDir, outputDir)
 	if err != nil {
 		log.Fatalln("Failed to initialize DigitalOcean Spaces client:", err)
 	}
-
-	// Check if the bucket exists
-	exists, err := minioClient.BucketExists(context.Background(), bucketName)
+	
+	exists, err := storage.BucketExists()
 	if err != nil {
 		log.Fatal(err)
 	}
 	if !exists {
 		log.Fatalf("Bucket '%s' does not exist", bucketName)
 	}
+}
 
-	// Create temporary directory for HLS files.
-	err = os.MkdirAll(tempDir, 0755)
+func prepareCache() {
+	var err error
+	cacheStorage, err = cache.New(cacheSize, tempDir)
 	if err != nil {
-		log.Fatalln("Failed to create temporary directory:", err)
+		log.Fatal(err)
 	}
+}
+
+func getObjectAndFileName(objectPath string) (string, string, error) {
+	parts := strings.SplitN(objectPath, "/", 2)
+	log.Println(parts)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("Invalid object path: %s", objectPath)
+	}
+	return parts[0], parts[1], nil
+}
+
+func writeErrorJson(w http.ResponseWriter, message string, statusCode int) {
+	w.WriteHeader(statusCode)
+	json := fmt.Sprintf(`{"error": "%s"}`, message)
+	w.Write([]byte(json))
+}
+
+func cloudFilePath(objectId string, filename string) string {
+	return fmt.Sprintf("%s/%s/%s", outputDir, objectId, filename)
+}
+
+func tmpFilePath(objectId string, filename string) string {
+	return fmt.Sprintf("%s/%s/%s", tempDir, objectId, filename)
+}
+
+func Run() {
+	prepareConfig()
+	prepareStorage()
+	prepareCache()
 
 	http.HandleFunc("/hls/", func(w http.ResponseWriter, r *http.Request) {
 		urlPath := r.URL.Path[len("/hls/"):]
-		parts := strings.SplitN(urlPath, "/", 2)
-		objectName := parts[0]
-		log.Println("Request for object:", parts, len(parts))
-		if len(parts) != 2 {
-			http.Error(w, "Invalid request", http.StatusBadRequest)
+		objectName, filename, error := getObjectAndFileName(urlPath)
+		if error != nil {
+			writeErrorJson(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
-		filename := parts[1]
-		log.Println("Request for object:", objectName)
 
 		// Check if the request is for the HLS playlist
 		isPlaylistRequest := filename == "playlist.m3u8"
 
-		log.Println("Request for playlist:", isPlaylistRequest)
 		// Check filename is one element
 		if !isPlaylistRequest && !isValidSegmentFilename(filename) {
-			http.Error(w, "Invalid request", http.StatusBadRequest)
+			writeErrorJson(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
 	
 		// Construct the object path based on the request type
-		objectPath := outputDir + "/" + objectName + "/" + filename
+		objectPath := cloudFilePath(objectName, filename)
+		localPath := tmpFilePath(objectName, filename)
 	
 		// Check if HLS files already exist.
-		hlsFilesExist, err := checkHLSFilesExist(objectName)
+		hlsFilesExist, err := storage.CheckObject(objectPath)
 		if err != nil {
 			log.Println("Failed to check if HLS files exist:", err)
-			http.Error(w, "Failed to check if HLS files exist", http.StatusInternalServerError)
+			writeErrorJson(w, "Failed to check HLS files", http.StatusInternalServerError)
 			return
 		}
-	
+
 		if !hlsFilesExist {
 			// Convert MP4 to HLS format.
-			err := convertToHLS(minioClient, bucketName, objectName)
+			err := convertToHLS(objectName)
 			if err != nil {
 				log.Println("Failed to convert MP4 to HLS:", err)
-				http.Error(w, "Failed to load HLS", http.StatusInternalServerError)
+				writeErrorJson(w, "Failed to load HLS", http.StatusInternalServerError)
 				return
 			}
 		}
-	
+
 		// Retrieve the requested object from DigitalOcean Spaces
-		object, err := minioClient.GetObject(context.Background(), bucketName, objectPath, minio.GetObjectOptions{})
+		object, err := storage.GetObject(objectPath)
 		if err != nil {
 			log.Println("Failed to retrieve object:", err)
-			http.Error(w, "Failed to retrieve object", http.StatusInternalServerError)
+			writeErrorJson(w, "Failed to retrieve object", http.StatusInternalServerError)
 			return
 		}
 	
 		// Set the appropriate content type for the response
-		contentType := "application/vnd.apple.mpegurl"
-		if !isPlaylistRequest {
-			contentType = "video/mp2t"
+		if isPlaylistRequest {
+			w.Header().Set("Content-Type",  "application/vnd.apple.mpegurl")
+		} else {
+			w.Header().Set("Content-Type", "video/mp2t")
 		}
-		w.Header().Set("Content-Type", contentType)
 	
 		// Serve the object content
-		http.ServeContent(w, r, filepath.Base(objectPath), time.Now(), object)
+		http.ServeContent(w, r, localPath, time.Now(), object)
 	})
 
 	log.Println("Server listening on :8080")
@@ -160,7 +196,7 @@ func checkHLSFilesExist(objectName string) (bool, error) {
 	}
 }
 
-func convertToHLS(client *minio.Client, bucket, objectName string) error {
+func convertToHLS(objectName string) error {
 	// Create temporary directory for the HLS files.
 	hlsDir := filepath.Join(tempDir, objectName)
 	err := os.MkdirAll(hlsDir, 0755)
@@ -175,8 +211,8 @@ func convertToHLS(client *minio.Client, bucket, objectName string) error {
 	// Download the MP4 object from DigitalOcean Spaces.
 	mp4FilePath := filepath.Join(tempDir, objectName+".mp4")
 	mp4DOPath := fmt.Sprintf("%s/%s.mp4", inputDir, objectName)
-	log.Println("Downloading MP4 file from DigitalOcean Spaces:", mp4DOPath)
-	err = client.FGetObject(context.Background(), bucket, mp4DOPath, mp4FilePath, minio.GetObjectOptions{})
+	
+	err = storage.FGetObject(mp4DOPath, mp4FilePath)
 	if err != nil {
 		log.Println("Here!")
 		return err
@@ -201,7 +237,7 @@ func convertToHLS(client *minio.Client, bucket, objectName string) error {
 	}
 
 	// Upload HLS files to DigitalOcean Spaces.
-	err = uploadHLSFiles(client, bucket, objectName, hlsDir)
+	err = uploadHLSFiles(objectName, hlsDir)
 	if err != nil {
 		return err
 	}
@@ -209,8 +245,10 @@ func convertToHLS(client *minio.Client, bucket, objectName string) error {
 	return nil
 }
 
-func uploadHLSFiles(client *minio.Client, bucket, objectName, hlsDir string) error {
+func uploadHLSFiles(objectName, hlsDir string) error {
 	err := filepath.Walk(hlsDir, func(path string, info os.FileInfo, err error) error {
+		defer os.Remove(path)
+
 		if err != nil {
 			return err
 		}
@@ -226,9 +264,9 @@ func uploadHLSFiles(client *minio.Client, bucket, objectName, hlsDir string) err
 		}
 
 		// Upload the HLS file to DigitalOcean Spaces.
-		objectPath := fmt.Sprintf("%s/%s/%s", outputDir, objectName, relativePath)
+		objectPath := cloudFilePath(objectName, relativePath)
 		log.Println("Uploading HLS file to DigitalOcean Spaces:", objectPath)
-		_, err = client.FPutObject(context.Background(), bucket, objectPath, path, minio.PutObjectOptions{})
+		_, err = storage.PutObject(objectPath, path)
 		if err != nil {
 			return err
 		}
