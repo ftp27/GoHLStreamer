@@ -253,7 +253,7 @@ func convertToHLS(objectName string) error {
 	cmd := exec.Command(ffmpegPath,
 		"-i", mp4FilePath,
 		"-c:v", "copy",
-		"-c:a", "aac",
+		"-c:a", "copy",
 		"-b:a", "128k",
 		"-hls_time", "10",
 		"-hls_list_size", "0",
