@@ -15,6 +15,7 @@ import (
 	"github.com/ftp27/GoHLStreamer/pkg/cache"
 	"github.com/ftp27/GoHLStreamer/pkg/appwrite"
 	"github.com/joho/godotenv"
+	"github.com/gorilla/mux"
 )
 
 var (
@@ -131,72 +132,62 @@ func tmpFilePath(objectId string, filename string) string {
 	return fmt.Sprintf("%s/%s/%s", tempDir, objectId, filename)
 }
 
-func Run() {
-	prepareConfig()
-	prepareStorage()
-	prepareCache()
-	prepareAppwrite()
+func hlsHandler(w http.ResponseWriter, r *http.Request) {
+	urlPath := r.URL.Path[len("/hls/"):]
+	objectName, filename, error := getObjectAndFileName(urlPath)
+	if error != nil {
+		writeErrorJson(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
 
-	http.HandleFunc("/hls/", func(w http.ResponseWriter, r *http.Request) {
-		urlPath := r.URL.Path[len("/hls/"):]
-		objectName, filename, error := getObjectAndFileName(urlPath)
-		if error != nil {
-			writeErrorJson(w, "Invalid request", http.StatusBadRequest)
-			return
-		}
+	// Check if the request is for the HLS playlist
+	isPlaylistRequest := filename == "playlist.m3u8"
 
-		// Check if the request is for the HLS playlist
-		isPlaylistRequest := filename == "playlist.m3u8"
+	// Check filename is one element
+	if !isPlaylistRequest && !isValidSegmentFilename(filename) {
+		writeErrorJson(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
 
-		// Check filename is one element
-		if !isPlaylistRequest && !isValidSegmentFilename(filename) {
-			writeErrorJson(w, "Invalid request", http.StatusBadRequest)
-			return
-		}
-	
-		// Construct the object path based on the request type
-		objectPath := cloudFilePath(objectName, filename)
-		localPath := tmpFilePath(objectName, filename)
-	
-		// Check if HLS files already exist.
-		hlsFilesExist, err := storage.CheckObject(objectPath)
+	// Construct the object path based on the request type
+	objectPath := cloudFilePath(objectName, filename)
+	localPath := tmpFilePath(objectName, filename)
+
+	// Check if HLS files already exist.
+	hlsFilesExist, err := storage.CheckObject(objectPath)
+	if err != nil {
+		log.Println("Failed to check if HLS files exist:", err)
+		writeErrorJson(w, "Failed to check HLS files", http.StatusInternalServerError)
+		return
+	}
+
+	if !hlsFilesExist {
+		// Convert MP4 to HLS format.
+		err := convertToHLS(objectName)
 		if err != nil {
-			log.Println("Failed to check if HLS files exist:", err)
-			writeErrorJson(w, "Failed to check HLS files", http.StatusInternalServerError)
+			log.Println("Failed to convert MP4 to HLS:", err)
+			writeErrorJson(w, "Failed to load HLS", http.StatusInternalServerError)
 			return
 		}
+	}
 
-		if !hlsFilesExist {
-			// Convert MP4 to HLS format.
-			err := convertToHLS(objectName)
-			if err != nil {
-				log.Println("Failed to convert MP4 to HLS:", err)
-				writeErrorJson(w, "Failed to load HLS", http.StatusInternalServerError)
-				return
-			}
-		}
+	// Retrieve the requested object from DigitalOcean Spaces
+	object, err := storage.GetObject(objectPath)
+	if err != nil {
+		log.Println("Failed to retrieve object:", err)
+		writeErrorJson(w, "Failed to retrieve object", http.StatusInternalServerError)
+		return
+	}
 
-		// Retrieve the requested object from DigitalOcean Spaces
-		object, err := storage.GetObject(objectPath)
-		if err != nil {
-			log.Println("Failed to retrieve object:", err)
-			writeErrorJson(w, "Failed to retrieve object", http.StatusInternalServerError)
-			return
-		}
-	
-		// Set the appropriate content type for the response
-		if isPlaylistRequest {
-			w.Header().Set("Content-Type",  "application/vnd.apple.mpegurl")
-		} else {
-			w.Header().Set("Content-Type", "video/mp2t")
-		}
-	
-		// Serve the object content
-		http.ServeContent(w, r, localPath, time.Now(), object)
-	})
+	// Set the appropriate content type for the response
+	if isPlaylistRequest {
+		w.Header().Set("Content-Type",  "application/vnd.apple.mpegurl")
+	} else {
+		w.Header().Set("Content-Type", "video/mp2t")
+	}
 
-	log.Println("Server listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Serve the object content
+	http.ServeContent(w, r, localPath, time.Now(), object)
 }
 
 func isValidSegmentFilename(filename string) bool {
@@ -308,4 +299,17 @@ func uploadHLSFiles(objectName, hlsDir string) error {
 	}
 
 	return nil
+}
+
+func Run() {
+	prepareConfig()
+	prepareStorage()
+	prepareCache()
+	prepareAppwrite()
+
+	r := mux.NewRouter()
+	r.PathPrefix("/hls/").HandlerFunc(hlsHandler).Methods(http.MethodGet)
+
+	log.Println("Server listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
