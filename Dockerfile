@@ -29,5 +29,8 @@ RUN apk add --no-cache ffmpeg
 # Expose the port that the server listens on
 EXPOSE 8080
 
+# Set the environment variables
+ENV FFMPEG_PATH=/usr/bin/ffmpeg
+
 # Set the entry point for the container
 CMD ["./server"]
