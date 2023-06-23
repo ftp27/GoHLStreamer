@@ -46,8 +46,22 @@ func (s *Spaces) GetObject(path string) (*minio.Object, error) {
 	return s.client.GetObject(context.Background(), s.BucketName, path, minio.GetObjectOptions{})
 }
 
+func (s *Spaces) GetObjectRange(path string, start int64, end int64) (*minio.Object, error) {
+	options := minio.GetObjectOptions{}
+	options.SetRange(start, end)
+	return s.client.GetObject(context.Background(), s.BucketName, path, options)
+}
+
 func (s *Spaces) PutObject(path string, source string) (minio.UploadInfo, error) {
 	return s.client.FPutObject(context.Background(), s.BucketName, path, source, minio.PutObjectOptions{})
+}
+
+func (s *Spaces) GetObjectSize(path string) (int64, error) {
+	info, err := s.client.StatObject(context.Background(), s.BucketName, path, minio.StatObjectOptions{})
+	if err != nil {
+		return 0, err
+	}
+	return info.Size, nil
 }
 
 func (s *Spaces) CheckObject(path string) (bool, error) {

@@ -118,6 +118,34 @@ func getObjectAndFileName(objectPath string) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
+func parseRangeHeader(header string, fileSize int64) (int64, int64, error) {
+	rangeHeader := strings.TrimPrefix(header, "bytes=")
+	rangeParts := strings.Split(rangeHeader, "-")
+	if len(rangeParts) != 2 {
+		return 0, 0, fmt.Errorf("invalid range header")
+	}
+
+	rangeStart, err := strconv.ParseInt(rangeParts[0], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to parse range start")
+	}
+
+	rangeEnd, err := strconv.ParseInt(rangeParts[1], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to parse range end")
+	}
+
+	if rangeEnd < 0 {
+		rangeEnd = fileSize - 1
+	}
+
+	if rangeStart >= fileSize || rangeEnd >= fileSize || rangeStart > rangeEnd {
+		return 0, 0, fmt.Errorf("invalid range values")
+	}
+
+	return rangeStart, rangeEnd, nil
+}
+
 func writeErrorJson(w http.ResponseWriter, message string, statusCode int) {
 	w.WriteHeader(statusCode)
 	json := fmt.Sprintf(`{"error": "%s"}`, message)
@@ -134,8 +162,8 @@ func tmpFilePath(objectId string, filename string) string {
 
 func hlsHandler(w http.ResponseWriter, r *http.Request) {
 	urlPath := r.URL.Path[len("/hls/"):]
-	objectName, filename, error := getObjectAndFileName(urlPath)
-	if error != nil {
+	objectName, filename, err := getObjectAndFileName(urlPath)
+	if err != nil {
 		writeErrorJson(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
@@ -143,7 +171,7 @@ func hlsHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if the request is for the HLS playlist
 	isPlaylistRequest := filename == "playlist.m3u8"
 
-	// Check filename is one element
+	// Check filename has a valid format
 	if !isPlaylistRequest && !isValidSegmentFilename(filename) {
 		writeErrorJson(w, "Invalid request", http.StatusBadRequest)
 		return
@@ -151,7 +179,6 @@ func hlsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Construct the object path based on the request type
 	objectPath := cloudFilePath(objectName, filename)
-	localPath := tmpFilePath(objectName, filename)
 
 	// Check if HLS files already exist.
 	hlsFilesExist, err := storage.CheckObject(objectPath)
@@ -171,23 +198,52 @@ func hlsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Retrieve the requested object from DigitalOcean Spaces
-	object, err := storage.GetObject(objectPath)
-	if err != nil {
-		log.Println("Failed to retrieve object:", err)
-		writeErrorJson(w, "Failed to retrieve object", http.StatusInternalServerError)
-		return
-	}
-
 	// Set the appropriate content type for the response
 	if isPlaylistRequest {
-		w.Header().Set("Content-Type",  "application/vnd.apple.mpegurl")
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	} else {
 		w.Header().Set("Content-Type", "video/mp2t")
 	}
 
-	// Serve the object content
-	http.ServeContent(w, r, localPath, time.Now(), object)
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader != "" {
+		objectSize, error := storage.GetObjectSize(objectPath)
+		if error != nil {
+			log.Println("Failed to retrieve object size:", error)
+			writeErrorJson(w, "Failed to retrieve object size", http.StatusInternalServerError)
+			return
+		}
+		// Parse the range header
+		rangeStart, rangeEnd, err := parseRangeHeader(rangeHeader, objectSize)
+		if err != nil {
+			log.Println("Failed to parse range header:", err)
+			writeErrorJson(w, "Failed to parse range header", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, objectSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(rangeEnd-rangeStart+1, 10))
+		// w.WriteHeader(http.StatusPartialContent)
+
+		object, err := storage.GetObjectRange(objectPath, rangeStart, rangeEnd)
+		if err != nil {
+			log.Println("Failed to retrieve object range:", err)
+			writeErrorJson(w, "Failed to retrieve object range", http.StatusInternalServerError)
+			return
+		}
+		
+		// Serve the object content
+		http.ServeContent(w, r, filename, time.Now(), object)
+	} else {
+		// Retrieve the requested object from DigitalOcean Spaces
+		object, err := storage.GetObject(objectPath)
+		if err != nil {
+			log.Println("Failed to retrieve object:", err)
+			writeErrorJson(w, "Failed to retrieve object", http.StatusInternalServerError)
+			return
+		}
+		// Serve the object content
+		http.ServeContent(w, r, filename, time.Now(), object)
+	}
 }
 
 func isValidSegmentFilename(filename string) bool {
